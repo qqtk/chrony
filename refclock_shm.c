@@ -1,0 +1,127 @@
+/*
+  chronyd/chronyc - Programs for keeping computer clocks accurate.
+
+ **********************************************************************
+ * Copyright (C) Miroslav Lichvar  2009
+ * 
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of version 2 of the GNU General Public License as
+ * published by the Free Software Foundation.
+ * 
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details.
+ * 
+ * You should have received a copy of the GNU General Public License along
+ * with this program; if not, write to the Free Software Foundation, Inc.,
+ * 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+ * 
+ **********************************************************************
+
+  =======================================================================
+
+  SHM refclock driver.
+
+  */
+
+#include "config.h"
+
+#include "sysincl.h"
+
+#include "refclock.h"
+#include "logging.h"
+#include "util.h"
+
+#define SHMKEY 0x4e545030
+
+struct shmTime {
+  int    mode; /* 0 - if valid set
+                *       use values, 
+                *       clear valid
+                * 1 - if valid set 
+                *       if count before and after read of values is equal,
+                *         use values 
+                *       clear valid
+                */
+  volatile int count;
+  time_t clockTimeStampSec;
+  int    clockTimeStampUSec;
+  time_t receiveTimeStampSec;
+  int    receiveTimeStampUSec;
+  int    leap;
+  int    precision;
+  int    nsamples;
+  volatile int valid;
+  int    clockTimeStampNSec;
+  int    receiveTimeStampNSec;
+  int    dummy[8]; 
+};
+
+static int shm_initialise(RCL_Instance instance) {
+  int id, param, perm;
+  char *s;
+  struct shmTime *shm;
+
+  param = atoi(RCL_GetDriverParameter(instance));
+  s = RCL_GetDriverOption(instance, "perm");
+  perm = s ? strtol(s, NULL, 8) & 0777 : 0600;
+
+  id = shmget(SHMKEY + param, sizeof (struct shmTime), IPC_CREAT | perm);
+  if (id == -1) {
+    LOG_FATAL(LOGF_Refclock, "shmget() failed");
+    return 0;
+  }
+   
+  shm = (struct shmTime *)shmat(id, 0, 0);
+  if ((long)shm == -1) {
+    LOG_FATAL(LOGF_Refclock, "shmat() failed");
+    return 0;
+  }
+
+  RCL_SetDriverData(instance, shm);
+  return 1;
+}
+
+static void shm_finalise(RCL_Instance instance)
+{
+  shmdt(RCL_GetDriverData(instance));
+}
+
+static int shm_poll(RCL_Instance instance)
+{
+  struct timeval tv;
+  struct shmTime t, *shm;
+  double offset;
+
+  shm = (struct shmTime *)RCL_GetDriverData(instance);
+
+  t = *shm;
+  
+  if ((t.mode == 1 && t.count != shm->count) ||
+    !(t.mode == 0 || t.mode == 1) || !t.valid) {
+    DEBUG_LOG(LOGF_Refclock, "SHM sample ignored mode=%d count=%d valid=%d",
+        t.mode, t.count, t.valid);
+    return 0;
+  }
+
+  shm->valid = 0;
+
+  tv.tv_sec = t.receiveTimeStampSec;
+  tv.tv_usec = t.receiveTimeStampUSec;
+
+  offset = t.clockTimeStampSec - t.receiveTimeStampSec;
+  if (t.clockTimeStampNSec / 1000 == t.clockTimeStampUSec &&
+      t.receiveTimeStampNSec / 1000 == t.receiveTimeStampUSec)
+    offset += (t.clockTimeStampNSec - t.receiveTimeStampNSec) * 1e-9;
+  else
+    offset += (t.clockTimeStampUSec - t.receiveTimeStampUSec) * 1e-6;
+
+  return RCL_AddSample(instance, &tv, offset, t.leap);
+}
+
+RefclockDriver RCL_SHM_driver = {
+  shm_initialise,
+  shm_finalise,
+  shm_poll
+};
